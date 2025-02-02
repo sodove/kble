@@ -13,6 +13,7 @@ data class ServiceSettings(
     val amperageMax: Float = 40f,
     val powerMin: Float = -800f,
     val powerMax: Float = 2000f,
+    val wheelDiameterInch: Float = 29f,
     val maximumVolumeAt: Float = 30f,
     val minimalVolume: Float = 5f,
     val volumeServiceEnabled: Boolean = false,

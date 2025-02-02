@@ -26,6 +26,7 @@ class ServiceSettingsPreferences(
             putFloat("amperageMax", settings.amperageMax)
             putFloat("powerMin", settings.powerMin)
             putFloat("powerMax", settings.powerMax)
+            putFloat("wheelDiameterInch", settings.wheelDiameterInch)
             putFloat("maximumVolumeAt", settings.maximumVolumeAt)
             putFloat("minimalVolume", settings.minimalVolume)
             putBoolean("volumeServiceEnabled", settings.volumeServiceEnabled)
@@ -42,11 +43,16 @@ class ServiceSettingsPreferences(
             amperageMax = sharedPreferences.getFloat("amperageMax", 40f),
             powerMin = sharedPreferences.getFloat("powerMin", -500f),
             powerMax = sharedPreferences.getFloat("powerMax", 2000f),
+            wheelDiameterInch = sharedPreferences.getFloat("wheelDiameterInch", 29f),
             minimalVolume = sharedPreferences.getFloat("minimalVolume", 5f),
             maximumVolumeAt = sharedPreferences.getFloat("maximumVolumeAt", 30f),
             volumeServiceEnabled = sharedPreferences.getBoolean("volumeServiceEnabled", false),
             wakelockVariant = sharedPreferences.getString("wakelockVariant", null)
                 ?.let { WakelockVariant.valueOf(it) } ?: WakelockVariant.HIDDEN_ALLOWED_CPU
         )
+    }
+
+    companion object {
+        var spref: SharedPreferences? = null
     }
 }

@@ -4,7 +4,7 @@ import android.annotation.SuppressLint
 
 
 @SuppressLint("DefaultLocale")
-fun Float.wrap(symbolsAfter: Int) = String.format("%.${symbolsAfter}f", this)
+fun Float.wrap(symbolsAfter: Int) = String.format("%.${symbolsAfter}f", this).replace(",", ".")
 
 fun <T> safely(action: () -> T): T? = runCatching { action.invoke() }.getOrNull()
 

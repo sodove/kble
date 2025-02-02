@@ -5,54 +5,108 @@ package ru.sodovaya.kble.utils
 import android.util.Log
 import ru.sodovaya.kble.service.ScooterData
 
-fun ParseScooterData(scooterData: ScooterData = ScooterData(), value: ByteArray): ScooterData? {
-    Log.d("ParseScooterData", "Received new bytearray: ${value.toHexString(HexFormat.Default)}")
+data class ControllerData(
+    val throttle: Int = 0,
+    val brakePedal: Int = 0,
+    val switchBrake: Int = 0,
+    val switchForward: Int = 0,
+    val switchFoot: Int = 0,
+    val switchReverse: Int = 0,
+    val switchHallA: Int = 0,
+    val switchHallB: Int = 0,
+    val switchHallC: Int = 0,
+    val voltageBattery: Int = 0,
+    val temperatureMotor: Int = 0,
+    val temperatureController: Int = 0,
+    val directionSetting: Int = 0,
+    val directionActual: Int = 0,
+    val motorSpeed: Int = 0,
+    val phaseCurrent: Int = 0
+)
 
-    val updatedCache = (scooterData.partialDataCache ?: byteArrayOf()) + value
+fun ControllerData.toScooterData(): ScooterData {
+    Log.d("ContrData", this.toString())
+    return ScooterData(
+        isConnected = "Maybe connected",
+        voltage = voltageBattery.toDouble(),
+        speed = rpmToSpeed(motorSpeed),
+        battery = 100,
+        amperage = phaseCurrent.toDouble(),
+        temperature = temperatureController
+    )
+}
 
-    return if (updatedCache.size >= 25) {
-        val fullData = updatedCache.take(25).toByteArray()
-
-        parseFullData(scooterData, fullData)?.copy(
-            partialDataCache = null
-        )
-    } else {
-        scooterData.copy(partialDataCache = updatedCache)
+fun ParseScooterData(controllerData: ControllerData = ControllerData(), value: ByteArray): ControllerData? {
+    return when (value[0]) {
+        0x3A.toByte() -> unpackPacketA(value, controllerData).also {
+            Log.i("KellyParser", "Parsing 0x3A data")
+        }
+        0x3B.toByte() -> unpackPacketB(value, controllerData).also {
+            Log.i("KellyParser", "Parsing 0x3B data")
+        }
+        else -> {
+            Log.w("KellyParser", "Something is wrong in received bytearray")
+            Log.w("KellyParser", value.toHexString(HexFormat.Default))
+            null
+        }
     }
 }
 
-private fun parseFullData(scooterData: ScooterData, value: ByteArray): ScooterData? {
-    if (value.size != 25) return null
-
-    return if (value[1] == 0x00.toByte()) {
-        val speed = ((value[6].toInt() and 0xFF) shl 8) or (value[7].toInt() and 0xFF)
-        val voltage = (value[10].toInt() shl 8) or (value[11].toInt() and 0xFF)
-        val amperage = if (value[12].toInt() < 128) {
-            ((value[12].toInt() shl 8) or (value[13].toInt() and 0xFF)) / 64.0
-        } else {
-            (65535 - ((value[12].toInt() shl 8) or (value[13].toInt() and 0xFF))) * -1 / 64.0
-        }
-        val tripDistance = (value[16].toInt() shl 8) or (value[17].toInt() and 0xFF)
-        val totalDistance = (value[18].toInt() shl 16) or (value[19].toInt() shl 8) or (value[20].toInt() and 0xFF)
-
-        scooterData.copy(
-            gear = value[4].toInt(),
-            battery = value[5].toInt(),
-            speed = speed / 1000.0,
-            voltage = voltage / 10.0,
-            amperage = amperage,
-            temperature = value[14].toInt(),
-            trip = tripDistance / 10.0,
-            totalDist = totalDistance / 10.0
-        )
-    } else {
-        scooterData.copy(
-            maximumSpeed = when (scooterData.gear) {
-                0 -> value[4].toInt()
-                1 -> value[5].toInt()
-                2 -> value[6].toInt()
-                else -> 0
-            }
+fun unpackPacketA(raw: ByteArray, controllerData: ControllerData): ControllerData? {
+    if (raw.size == 19 && raw[0] == 0x3A.toByte() && raw[18] == getChecksum(raw)) {
+        val throttle = raw[2].toInt()
+        val brakePedal = raw[3].toInt()
+        val switchBrake = raw[4].toInt()
+        val switchForward = raw[5].toInt()
+        val switchFoot = raw[6].toInt()
+        val switchReverse = raw[7].toInt()
+        val switchHallA = raw[8].toInt()
+        val switchHallB = raw[9].toInt()
+        val switchHallC = raw[10].toInt()
+        val voltageBattery = raw[11].toInt()
+        val temperatureMotor = raw[12].toInt()
+        val temperatureController = raw[13].toInt()
+        val directionSetting = raw[14].toInt()
+        val directionActual = raw[15].toInt()
+        return controllerData.copy(
+            throttle = throttle,
+            brakePedal = brakePedal,
+            switchBrake = switchBrake,
+            switchForward = switchForward,
+            switchFoot = switchFoot,
+            switchReverse = switchReverse,
+            switchHallA = switchHallA,
+            switchHallB = switchHallB,
+            switchHallC = switchHallC,
+            voltageBattery = voltageBattery,
+            temperatureMotor = temperatureMotor,
+            temperatureController = temperatureController,
+            directionSetting = directionSetting,
+            directionActual = directionActual,
         )
     }
+    return null
+}
+
+fun unpackPacketB(raw: ByteArray, controllerData: ControllerData): ControllerData? {
+    if (raw.size == 19 && raw[0] == 0x3B.toByte() && raw[18] == getChecksum(raw)) {
+        val motorSpeed = raw[5].toUByte().toInt() + (raw[4].toUByte().toInt() * 255)
+        val phaseCurrent = raw[7].toUByte().toInt() + (raw[6].toUByte().toInt() * 255)
+        return controllerData.copy(
+            motorSpeed = motorSpeed,
+            phaseCurrent = phaseCurrent
+        )
+    }
+    return null
+}
+
+private fun getChecksum(raw: ByteArray): Byte {
+    var checksum = 0
+    for (i in 0 until raw.size - 1) {
+        checksum += raw[i].toInt()
+        if (checksum > 0xFF) {
+            checksum -= 0xFF
+        }
+    }
+    return checksum.toByte()
 }

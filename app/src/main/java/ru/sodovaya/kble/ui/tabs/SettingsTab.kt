@@ -89,6 +89,7 @@ object SettingsTab : ScreenTab {
                 }
             }
 
+            // Voltage
             item {
                 SettingRangeSlider(
                     label = "Voltage Gauge Range",
@@ -110,7 +111,7 @@ object SettingsTab : ScreenTab {
                 SettingRangeSlider(
                     label = "Amperage Gauge Range",
                     value = settings.amperageMin .. settings.amperageMax,
-                    range = -50f..80f,
+                    range = -50f..200f,
                     onValueChange = { newValue ->
                         settingsState.updateSettings(
                             settings.copy(
@@ -122,17 +123,16 @@ object SettingsTab : ScreenTab {
                 )
             }
 
-            // Power
+            // Wheel diameter
             item {
-                SettingRangeSlider(
-                    label = "Power Gauge Range",
-                    value = settings.powerMin .. settings.powerMax,
-                    range = -1500f..3000f,
+                SettingSlider(
+                    label = "Wheel diameter",
+                    value = settings.wheelDiameterInch,
+                    range = 0f..30f,
                     onValueChange = { newValue ->
                         settingsState.updateSettings(
                             settings.copy(
-                                powerMin = newValue.start.roundToInt().toFloat(),
-                                powerMax = newValue.endInclusive.roundToInt().toFloat()
+                                wheelDiameterInch = newValue
                             )
                         )
                     }
@@ -266,7 +266,7 @@ object SettingsTab : ScreenTab {
             "${context.packageName}.provider",
             logFile
         )
-        
+
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_STREAM, uri)

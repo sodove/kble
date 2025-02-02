@@ -21,15 +21,19 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import ru.sodovaya.kble.R
+import ru.sodovaya.kble.bms.AntBt
 import ru.sodovaya.kble.settings.ServiceSettingsPreferences
 import ru.sodovaya.kble.settings.ServiceSettingsState
+import ru.sodovaya.kble.utils.ControllerData
 import ru.sodovaya.kble.utils.ParseScooterData
 import ru.sodovaya.kble.utils.READ_UUID
 import ru.sodovaya.kble.utils.SEND_UUID
 import ru.sodovaya.kble.utils.SERVICE_UUID
 import ru.sodovaya.kble.utils.convertToPercentage
-import ru.sodovaya.kble.utils.midway
+import ru.sodovaya.kble.utils.toScooterData
 import java.util.Timer
 import java.util.UUID
 import kotlin.concurrent.timer
@@ -42,9 +46,11 @@ class BluetoothForegroundService : Service() {
     }
     private var wakeLock: PowerManager.WakeLock? = null
 
-    private var gatt: BluetoothGatt? = null
+    private var scooterGatt: BluetoothGatt? = null
     private var characteristicWrite: BluetoothGattCharacteristic? = null
     private var characteristicRead: BluetoothGattCharacteristic? = null
+    private var antBms: AntBt? = null
+    private var controllerData = ControllerData()
     private var isAlive = false
     private var scooterData = ScooterData()
     private var settings = ServiceSettings()
@@ -116,10 +122,9 @@ class BluetoothForegroundService : Service() {
     }
 
     private fun connectToDevice(device: BluetoothDevice) {
-        gatt = device.connectGatt(this, false, object : BluetoothGattCallback() {
+        scooterGatt = device.connectGatt(this, false, object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 scooterData = scooterData.copy(
-                    deviceName = gatt.device.name.midway(),
                     isConnected = newState.toConnectionStateString()
                 )
                 val intent = Intent("BluetoothData")
@@ -133,16 +138,16 @@ class BluetoothForegroundService : Service() {
                 if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     if (isAlive.not())
                         onDestroy()
-                    else
-                        connect(device.address)
+                    else {}
+//                        connect(device.address)
                 }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                 characteristicWrite = gatt.getService(SERVICE_UUID)?.getCharacteristic(SEND_UUID)
-                characteristicRead = gatt.getService(SERVICE_UUID)?.getCharacteristic(READ_UUID)
+                characteristicRead = characteristicWrite
 
-                if (characteristicWrite == null || characteristicRead == null) {
+                if (characteristicWrite == null) {
                     scooterData = scooterData.copy(isConnected = "Services failed")
                     val dataIntent = Intent("BluetoothData")
                     dataIntent.putExtra("data", scooterData)
@@ -154,8 +159,23 @@ class BluetoothForegroundService : Service() {
                 enableNotifications(characteristicRead!!)
 
                 noiseTimer?.cancel()
-                noiseTimer = timer(period = 500) {
-                    sendNoise(gatt, characteristicWrite!!)
+                noiseTimer = timer(period = 100) {
+                    runBlocking {
+                        sendCommands(gatt, characteristicWrite!!)
+                        runCatching {
+                            antBms?.let {
+                                if (antBms!!.connect()) {
+                                    val sample = antBms!!.fetch()
+                                    scooterData = scooterData.copy(
+                                        voltage = sample.voltage.toDouble(),
+                                        amperage = sample.current.toDouble()
+                                    )
+                                }
+                            }
+                        }.onFailure {
+                            Log.e("AntBMS Failed", it.message ?: "unk")
+                        }
+                    }
                 }
             }
 
@@ -164,12 +184,17 @@ class BluetoothForegroundService : Service() {
             ) {
                 if (characteristic.uuid == READ_UUID) {
                     scooterData = scooterData.copy(isConnected = "Got info")
-                    ParseScooterData(scooterData = scooterData, value = data)?.let {
+                    ParseScooterData(controllerData = controllerData, value = data)?.let {
                         wakeLock?.acquire(5*60*1000L)
-                        scooterData = it
+                        controllerData = it
                     }
                     val dataIntent = Intent("BluetoothData")
-                    dataIntent.putExtra("data", scooterData)
+                    val data = controllerData.toScooterData()
+                    dataIntent.putExtra("data", scooterData.copy(
+                        speed = data.speed,
+                        battery = data.battery,
+                        temperature = data.temperature,
+                    ))
                     sendBroadcast(dataIntent)
                 }
             }
@@ -178,21 +203,19 @@ class BluetoothForegroundService : Service() {
                 val intent = Intent("BluetoothData")
                 intent.putExtra("connection", "Updating info")
                 sendBroadcast(intent)
-                if (gatt != null) {
-                    gatt!!.setCharacteristicNotification(characteristic, true)
+                if (scooterGatt != null) {
+                    scooterGatt!!.setCharacteristicNotification(characteristic, true)
                     val descriptor = characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
 
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        gatt!!.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                        scooterGatt!!.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
                     } else {
                         descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        gatt!!.writeDescriptor(descriptor)
+                        scooterGatt!!.writeDescriptor(descriptor)
                     }
                 }
             }
         })
-
-        gatt?.requestMtu(2000)
     }
 
     override fun onDestroy() {
@@ -201,7 +224,8 @@ class BluetoothForegroundService : Service() {
         try {
             noiseTimer?.cancel()
             volumeTimer?.cancel()
-            gatt?.close()
+            scooterGatt?.close()
+            antBms?.disconnect()
             wakeLock?.let {
                 if (it.isHeld) {
                     it.release()
@@ -214,21 +238,27 @@ class BluetoothForegroundService : Service() {
         }
     }
 
-    private fun sendNoise(
+    private suspend fun sendCommands(
         gatt: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
     ) {
-        val data = byteArrayOf(0xFF.toByte())
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeCharacteristic(
-                characteristic,
-                data,
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-            )
-        } else {
-            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            characteristic.value = data
-            gatt.writeCharacteristic(characteristic)
+        val data = arrayOf(
+            byteArrayOf(0x3A, 0x00, 0x3A),
+            byteArrayOf(0x3B, 0x00, 0x3B)
+        )
+        data.forEach {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(
+                    characteristic,
+                    it,
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                )
+            } else {
+                characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                characteristic.value = it
+                gatt.writeCharacteristic(characteristic)
+            }
+            delay(50)
         }
     }
 
@@ -260,6 +290,9 @@ class BluetoothForegroundService : Service() {
         val device = bluetoothAdapter.getRemoteDevice(deviceAddress)
         device?.address?.let { Log.d("BFGS", it) }
         device?.let { connectToDevice(it) }
+
+        val ant = bluetoothAdapter.getRemoteDevice("32:E3:2E:02:23:45")
+        ant?.let { antBms = AntBt(this.applicationContext, ant) }
     }
 
     private fun Int.toConnectionStateString() = when (this) {
