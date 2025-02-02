@@ -19,6 +19,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "mdash"
+rootProject.name = "kble"
 include(":app")
  

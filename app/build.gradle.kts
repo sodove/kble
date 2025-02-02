@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "ru.sodovaya.mdash"
+    namespace = "ru.sodovaya.kble"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "ru.sodovaya.mdash"
+        applicationId = "ru.sodovaya.kble"
         minSdk = 24
         targetSdk = 34
         versionCode = 2
@@ -23,6 +23,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {
