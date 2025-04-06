@@ -11,7 +11,9 @@ class ServiceSettingsPreferences(
 ) {
 
     private val sharedPreferences: SharedPreferences =
-        context.getSharedPreferences("ServiceSettingsPrefs", Context.MODE_PRIVATE)
+        context.getSharedPreferences("ServiceSettingsPrefs", Context.MODE_PRIVATE).also {
+            spref = it
+        }
 
     init {
         val loadedSettings = loadServiceSettings()

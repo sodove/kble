@@ -1,10 +1,11 @@
 package ru.sodovaya.kble.service
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
@@ -14,14 +15,22 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.media.AudioManager
-import android.media.AudioManager.STREAM_MUSIC
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
+import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import ru.sodovaya.kble.R
 import ru.sodovaya.kble.bms.AntBt
@@ -39,27 +48,131 @@ import java.util.UUID
 import kotlin.concurrent.timer
 import kotlin.math.roundToInt
 
-class BluetoothForegroundService : Service() {
-    private val bluetoothAdapter: BluetoothAdapter by lazy {
-        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-        bluetoothManager.adapter
-    }
-    private var wakeLock: PowerManager.WakeLock? = null
-
-    private var scooterGatt: BluetoothGatt? = null
-    private var characteristicWrite: BluetoothGattCharacteristic? = null
-    private var characteristicRead: BluetoothGattCharacteristic? = null
+class BmsManager(private val context: Context, private val device: BluetoothDevice?) {
     private var antBms: AntBt? = null
-    private var controllerData = ControllerData()
+    var currentVoltage = 0.0
+    var currentAmperage = 0.0
+
+    fun connectBms() {
+        device ?: return
+        antBms = AntBt(context, device)
+    }
+
+    suspend fun updateBmsData() = runCatching {
+        if (antBms?.connect() == true) {
+            val sample = antBms!!.fetch()
+            currentVoltage = sample.voltage.toDouble()
+            currentAmperage = sample.current.toDouble()
+        }
+    }.onFailure {
+        Log.e("BmsManager", "Ошибка BMS: ${it.message}")
+    }
+
+    fun disconnectBms() {
+        antBms?.disconnect()
+    }
+}
+
+class KellyManager(private val context: Context, private val device: BluetoothDevice) {
+    var controllerData = ControllerData()
+    private var gatt: BluetoothGatt? = null
+    private var writeChar: BluetoothGattCharacteristic? = null
+
+    fun connect(onConnected: () -> Unit) {
+        gatt = device.connectGatt(context, false, object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                if (newState == BluetoothProfile.STATE_CONNECTED) gatt.discoverServices()
+                else if (newState == BluetoothProfile.STATE_DISCONNECTED) close()
+            }
+
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                writeChar = gatt.getService(SERVICE_UUID)?.getCharacteristic(SEND_UUID)
+                if (writeChar == null) {
+                    close(); return
+                }
+                enableNotifications(gatt)
+                onConnected()
+            }
+
+            override fun onCharacteristicChanged(gatt: BluetoothGatt, c: BluetoothGattCharacteristic, data: ByteArray) {
+                if (c.uuid == READ_UUID) {
+                    ParseScooterData(controllerData, data)?.let { updated -> controllerData = updated }
+                }
+            }
+        })
+    }
+
+    private fun enableNotifications(gatt: BluetoothGatt) {
+        val readChar = gatt.getService(SERVICE_UUID)?.getCharacteristic(READ_UUID) ?: return
+        gatt.setCharacteristicNotification(readChar, true)
+        val desc = readChar.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+        } else {
+            desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            gatt.writeDescriptor(desc)
+        }
+    }
+
+    suspend fun sendCommands() {
+        val cmds = listOf(byteArrayOf(0x3A, 0x00, 0x3A), byteArrayOf(0x3B, 0x00, 0x3B))
+        val localGatt = gatt ?: return
+        writeChar ?: return
+        cmds.forEach {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                localGatt.writeCharacteristic(writeChar!!, it, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+            } else {
+                writeChar!!.value = it
+                writeChar!!.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                localGatt.writeCharacteristic(writeChar!!)
+            }
+            delay(50)
+        }
+    }
+
+    fun close() {
+        gatt?.close()
+        gatt = null
+    }
+}
+
+class GpsSpeedManager(private val context: Context) : LocationListener {
+    var gpsSpeed = 0f
+    private var locationManager: LocationManager? = null
+
+    @SuppressLint("MissingPermission")
+    fun startLocationUpdates() {
+        locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            locationManager?.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0L, 0f, this)
+        }
+    }
+
+    fun stopLocationUpdates() {
+        locationManager?.removeUpdates(this)
+    }
+
+    override fun onLocationChanged(location: Location) {
+        gpsSpeed = location.speed * 3.6f
+    }
+}
+
+class BluetoothForegroundService : Service() {
+    private val bluetoothAdapter by lazy {
+        (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+    }
+
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var bmsManager: BmsManager? = null
+    private var kellyManager: KellyManager? = null
+    private var gpsManager: GpsSpeedManager? = null
+
     private var isAlive = false
-    private var scooterData = ScooterData()
-    private var settings = ServiceSettings()
     private var noiseTimer: Timer? = null
     private var volumeTimer: Timer? = null
+    private var settings = ServiceSettings()
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val settingsState = ServiceSettingsState(ServiceSettings(), null)
@@ -67,239 +180,117 @@ class BluetoothForegroundService : Service() {
 
         val deviceAddress: String? = intent?.getStringExtra("device")
 
-        val wakelockLevel = when (settings.wakelockVariant) {
-            WakelockVariant.KEEP_SCREEN_ON -> PowerManager.PARTIAL_WAKE_LOCK
-            WakelockVariant.HIDDEN_ALLOWED_CPU -> PowerManager.PARTIAL_WAKE_LOCK
-            WakelockVariant.DISABLED -> 0
-        }
-
-        volumeThreadWorker()
-
-        if (wakelockLevel != 0) {
-            wakeLock?.release()
-            wakeLock =
-                (getSystemService(Context.POWER_SERVICE) as PowerManager).run {
-                    newWakeLock(wakelockLevel, "EndlessService::lock").apply {
-                        acquire(5 * 60 * 1000L /*5 minutes*/)
-                    }
-                }
-        }
-
-        if (deviceAddress != null) {
+        if (deviceAddress != null){
             isAlive = true
-            connect(deviceAddress)
+            setupWakelock()
+
+            startForeground(1, createNotification())
+            connectKellyAndBms(deviceAddress)
+            setupGpsSpeed()
+            volumeThreadWorker()
+            broadcastThread()
         }
-        startForeground(
-            /* id = */ 1,
-            /* notification = */ createNotification(),
-        )
+
         return START_STICKY
     }
 
     private fun createNotification(): Notification {
-        val notificationChannelId = "BLUETOOTH_SERVICE_CHANNEL"
+        val channelId = "BLUETOOTH_SERVICE_CHANNEL"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val notificationChannel = NotificationChannel(
-                /* id = */ notificationChannelId,
-                /* name = */ "kble Service",
-                /* importance = */ NotificationManager.IMPORTANCE_LOW
-            )
-            notificationChannel.description = "kble Service"
-            notificationChannel.enableVibration(false)
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(notificationChannel)
+            val channel = NotificationChannel(channelId, "kble Service", NotificationManager.IMPORTANCE_LOW)
+            channel.description = "kble Service"
+            channel.enableVibration(false)
+            getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
         }
-
-        val notificationBuilder = NotificationCompat.Builder(
-            /* context = */ this,
-            /* channelId = */ notificationChannelId
-        ).setContentTitle("kble Status")
-            .setContentText("Foreground service is active.")
+        return NotificationCompat.Builder(this, channelId)
+            .setContentTitle("kble")
+            .setContentText("Сервис работает")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setOngoing(true)
-
-        return notificationBuilder.build()
+            .build()
     }
 
-    private fun connectToDevice(device: BluetoothDevice) {
-        scooterGatt = device.connectGatt(this, false, object : BluetoothGattCallback() {
-            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-                scooterData = scooterData.copy(
-                    isConnected = newState.toConnectionStateString()
-                )
-                val intent = Intent("BluetoothData")
-                intent.putExtra("data", scooterData)
-                sendBroadcast(intent)
-
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    gatt.discoverServices()
-                }
-
-                if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    if (isAlive.not())
-                        onDestroy()
-                    else {}
-//                        connect(device.address)
+    private fun connectKellyAndBms(deviceAddress: String) {
+        val kellyDevice = bluetoothAdapter.getRemoteDevice(deviceAddress)
+        kellyDevice?.let {
+            kellyManager = KellyManager(this, it).apply {
+                connect {
+                    noiseTimer?.cancel()
+                    noiseTimer = timer(period = 100) { runBlocking { sendCommands() } }
                 }
             }
+        }
 
-            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                characteristicWrite = gatt.getService(SERVICE_UUID)?.getCharacteristic(SEND_UUID)
-                characteristicRead = characteristicWrite
+        val bmsDevice = bluetoothAdapter.getRemoteDevice("32:E3:2E:02:23:45")
+        bmsManager = BmsManager(this, bmsDevice).apply { connectBms() }
 
-                if (characteristicWrite == null) {
-                    scooterData = scooterData.copy(isConnected = "Services failed")
-                    val dataIntent = Intent("BluetoothData")
-                    dataIntent.putExtra("data", scooterData)
-                    sendBroadcast(dataIntent)
-                    onDestroy()
-                    return
-                }
-
-                enableNotifications(characteristicRead!!)
-
-                noiseTimer?.cancel()
-                noiseTimer = timer(period = 100) {
-                    runBlocking {
-                        sendCommands(gatt, characteristicWrite!!)
-                        runCatching {
-                            antBms?.let {
-                                if (antBms!!.connect()) {
-                                    val sample = antBms!!.fetch()
-                                    scooterData = scooterData.copy(
-                                        voltage = sample.voltage.toDouble(),
-                                        amperage = sample.current.toDouble()
-                                    )
-                                }
-                            }
-                        }.onFailure {
-                            Log.e("AntBMS Failed", it.message ?: "unk")
-                        }
-                    }
-                }
+        CoroutineScope(Dispatchers.IO).launch {
+            while (isAlive) {
+                delay(500)
+                bmsManager?.updateBmsData()
             }
-
-            override fun onCharacteristicChanged(
-                gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, data: ByteArray
-            ) {
-                if (characteristic.uuid == READ_UUID) {
-                    scooterData = scooterData.copy(isConnected = "Got info")
-                    ParseScooterData(controllerData = controllerData, value = data)?.let {
-                        wakeLock?.acquire(5*60*1000L)
-                        controllerData = it
-                    }
-                    val dataIntent = Intent("BluetoothData")
-                    val data = controllerData.toScooterData()
-                    dataIntent.putExtra("data", scooterData.copy(
-                        speed = data.speed,
-                        battery = data.battery,
-                        temperature = data.temperature,
-                    ))
-                    sendBroadcast(dataIntent)
-                }
-            }
-
-            private fun enableNotifications(characteristic: BluetoothGattCharacteristic) {
-                val intent = Intent("BluetoothData")
-                intent.putExtra("connection", "Updating info")
-                sendBroadcast(intent)
-                if (scooterGatt != null) {
-                    scooterGatt!!.setCharacteristicNotification(characteristic, true)
-                    val descriptor = characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        scooterGatt!!.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                    } else {
-                        descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        scooterGatt!!.writeDescriptor(descriptor)
-                    }
-                }
-            }
-        })
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        isAlive = false
-        try {
-            noiseTimer?.cancel()
-            volumeTimer?.cancel()
-            scooterGatt?.close()
-            antBms?.disconnect()
-            wakeLock?.let {
-                if (it.isHeld) {
-                    it.release()
-                }
-            }
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-        } catch (e: Exception) {
-            Log.d("TAG", "Service stopped without being started: ${e.message}")
         }
     }
 
-    private suspend fun sendCommands(
-        gatt: BluetoothGatt,
-        characteristic: BluetoothGattCharacteristic,
-    ) {
-        val data = arrayOf(
-            byteArrayOf(0x3A, 0x00, 0x3A),
-            byteArrayOf(0x3B, 0x00, 0x3B)
-        )
-        data.forEach {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(
-                    characteristic,
-                    it,
-                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-                )
-            } else {
-                characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                characteristic.value = it
-                gatt.writeCharacteristic(characteristic)
-            }
-            delay(50)
-        }
+    private fun setupGpsSpeed() {
+        gpsManager = GpsSpeedManager(this).apply { startLocationUpdates() }
     }
 
     private fun volumeThreadWorker() {
-        val audioManager = applicationContext.getSystemService(AUDIO_SERVICE) as AudioManager
-        val maxVolume = audioManager.getStreamMaxVolume(STREAM_MUSIC)
+        val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+        val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
 
         volumeTimer?.cancel()
         if (settings.volumeServiceEnabled) {
             volumeTimer = timer(period = 150) {
                 val minimalVolume = settings.minimalVolume
                 val maximumVolumeAt = settings.maximumVolumeAt
-                val speed = scooterData.speed
-                val calculatedVolume = run {
-                    (convertToPercentage(
-                        currentValue = speed.toFloat(),
-                        minValue = 0f,
-                        maxValue = maximumVolumeAt
-                    ) / 100 * maxVolume
-                    ).coerceIn(minimalVolume, maxVolume.toFloat())
-                }
-
-                audioManager.setStreamVolume(STREAM_MUSIC, calculatedVolume.roundToInt(), 0)
+                val kellySpeed = kellyManager?.controllerData?.toScooterData()?.speed?.toFloat() ?: 0f
+                val calcVolume = (convertToPercentage(kellySpeed, 0f, maximumVolumeAt) / 100f * maxVolume)
+                    .coerceIn(minimalVolume, maxVolume.toFloat())
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, calcVolume.roundToInt(), 0)
             }
         }
     }
 
-    private fun connect(deviceAddress: String) {
-        val device = bluetoothAdapter.getRemoteDevice(deviceAddress)
-        device?.address?.let { Log.d("BFGS", it) }
-        device?.let { connectToDevice(it) }
-
-        val ant = bluetoothAdapter.getRemoteDevice("32:E3:2E:02:23:45")
-        ant?.let { antBms = AntBt(this.applicationContext, ant) }
+    private fun broadcastThread() {
+        GlobalScope.launch(Dispatchers.Default) {
+            while (isAlive) {
+                val dataIntent = Intent("BluetoothData")
+                val kData = kellyManager?.controllerData?.toScooterData()
+                dataIntent.putExtra("kellySpeed", kData?.speed ?: 0f)
+                dataIntent.putExtra("gpsSpeed", gpsManager?.gpsSpeed ?: 0f)
+                dataIntent.putExtra("voltage", bmsManager?.currentVoltage ?: 0.0)
+                dataIntent.putExtra("amperage", bmsManager?.currentAmperage ?: 0.0)
+                sendBroadcast(dataIntent)
+                delay(300)
+            }
+        }
     }
 
-    private fun Int.toConnectionStateString() = when (this) {
-        BluetoothProfile.STATE_CONNECTED -> "Connected"
-        BluetoothProfile.STATE_CONNECTING -> "Connecting"
-        BluetoothProfile.STATE_DISCONNECTED -> "Disconnected"
-        BluetoothProfile.STATE_DISCONNECTING -> "Disconnecting"
-        else -> "N/A"
+    private fun setupWakelock() {
+        val wakelockLevel = when (settings.wakelockVariant) {
+            WakelockVariant.KEEP_SCREEN_ON, WakelockVariant.HIDDEN_ALLOWED_CPU -> PowerManager.PARTIAL_WAKE_LOCK
+            WakelockVariant.DISABLED -> 0
+        }
+        if (wakelockLevel != 0) {
+            wakeLock?.release()
+            wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                .newWakeLock(wakelockLevel, "EndlessService::lock")
+                .apply { acquire() }
+        }
+    }
+
+    override fun onDestroy() {
+        isAlive = false
+        noiseTimer?.cancel()
+        volumeTimer?.cancel()
+        kellyManager?.close()
+        bmsManager?.disconnectBms()
+        gpsManager?.stopLocationUpdates()
+        wakeLock?.let { if (it.isHeld) it.release() }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+        super.onDestroy()
     }
 }
